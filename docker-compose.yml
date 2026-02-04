@@ -1,0 +1,93 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: fire-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: fire_detection_site
+      POSTGRES_USER: fire_user
+      POSTGRES_PASSWORD: Tomer237878
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fire_user -d fire_detection_site"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio
+    container_name: fire-minio
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    container_name: fire-orchestrator
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+    ports:
+      - "5001:5001"
+    volumes:
+      - /home/linux/Desktop/fire_videos:/videos:ro
+      - ./configs:/app/configs:ro
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: fire-frames
+
+  backend:
+    build:
+      context: /home/linux/PycharmProjects/FireDetection_site/backend
+      dockerfile: ./Dockerfile
+    container_name: fire-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    ports:
+      - "5000:5000"
+    environment:
+      APP_ENV: development
+      SECRET_KEY: thekeyissupersecretwoww
+
+      DATABASE_URL: postgresql://fire_user:Tomer237878@postgres:5432/fire_detection_site
+
+      JWT_SECRET_KEY: superjwtsecret
+      JWT_COOKIE_SECURE: "false"
+      JWT_COOKIE_SAMESITE: Lax
+
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,http://localhost:5000
+
+      INFERENCE_URL: http://orchestrator:5001
+
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: fire-frames
+
+volumes:
+  postgres_data:
+  minio_data:
