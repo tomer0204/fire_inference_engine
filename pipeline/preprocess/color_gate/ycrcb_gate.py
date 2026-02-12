@@ -18,16 +18,19 @@ def ycrcb_fire_gate(frame_bgr, cfg: dict):
     cr = ycrcb[:, :, 1].astype(np.int16)
     cb = ycrcb[:, :, 2].astype(np.int16)
 
-    y_min = int(cfg["thresholds"]["y_min"])
-    cr_min = int(cfg["thresholds"]["cr_min"])
-    cb_max = int(cfg["thresholds"]["cb_max"])
-    cr_gt_cb_margin = int(cfg["thresholds"]["cr_gt_cb_margin"])
+    thr = cfg.get("thresholds", {})
+    y_min = int(thr.get("y_min", 120))
+    cr_min = int(thr.get("cr_min", 150))
+    cb_max = int(thr.get("cb_max", 130))
+    cr_gt_cb_margin = int(thr.get("cr_gt_cb_margin", 10))
 
     mask = (y >= y_min) & (cr >= cr_min) & (cb <= cb_max) & ((cr - cb) >= cr_gt_cb_margin)
     mask = mask.astype(np.uint8) * 255
 
-    k_open = int(cfg["morph"]["open"])
-    k_close = int(cfg["morph"]["close"])
+    morph = cfg.get("morph", {})
+    k_open = int(morph.get("open", 3))
+    k_close = int(morph.get("close", 7))
+
     if k_open > 0:
         ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open, k_open))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ker)
@@ -38,14 +41,16 @@ def ycrcb_fire_gate(frame_bgr, cfg: dict):
     fire_pixels = int(np.count_nonzero(mask))
     ratio = fire_pixels / float(mask.size)
 
-    min_ratio = float(cfg["decision"]["min_ratio"])
+    decision = cfg.get("decision", {})
+    min_ratio = float(decision.get("min_ratio", 0.001))
     is_suspicious = ratio >= min_ratio
 
-    rois = []
-    min_area = int(cfg["components"]["min_area"])
-    max_rois = int(cfg["components"]["max_rois"])
-    pad = int(cfg["components"]["pad"])
+    comps_cfg = cfg.get("components", {})
+    min_area = int(comps_cfg.get("min_area", 250))
+    max_rois = int(comps_cfg.get("max_rois", 3))
+    pad = int(comps_cfg.get("pad", 10))
 
+    rois = []
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     comps = []
     for i in range(1, num_labels):
@@ -53,6 +58,7 @@ def ycrcb_fire_gate(frame_bgr, cfg: dict):
         if area < min_area:
             continue
         comps.append((area, x, y0, x + ww, y0 + hh))
+
     comps.sort(key=lambda t: t[0], reverse=True)
 
     for area, x1, y1, x2, y2 in comps[:max_rois]:
@@ -60,16 +66,15 @@ def ycrcb_fire_gate(frame_bgr, cfg: dict):
         y1 -= pad
         x2 += pad
         y2 += pad
+
         clamped = _clamp_roi(x1, y1, x2, y2, w, h)
         if clamped is None:
             continue
+
         x1, y1, x2, y2 = clamped
         rois.append({
-            "x1": x1,
-            "y1": y1,
-            "x2": x2,
-            "y2": y2,
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
             "score": float(area) / float(w * h)
         })
 
-    return is_suspicious, ratio, rois
+    return is_suspicious, float(ratio), rois
