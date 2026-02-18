@@ -1,80 +1,85 @@
-use crate::io::{BackendConfig, ModelConfig, RawOutput, Tensor};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use async_trait::async_trait;
+use ort::{
+    environment::Environment,
+    session::SessionBuilder,
+    tensor::OrtOwnedTensor,
+    value::Value,
+};
+use ort::execution_providers::{CUDAExecutionProvider, ExecutionProvider};
+use std::path::Path;
+use std::sync::Arc;
 
-#[derive(Clone, Serialize, Deserialize)]
-pub enum BackendKind {
-    Dummy,
-    Triton,
-}
+use crate::io::{RawOutput, Tensor};
 
-#[async_trait::async_trait]
+#[async_trait]
 pub trait YoloBackend: Send + Sync {
-    async fn infer(&self, input: &Tensor) -> Result<RawOutput>;
+    async fn infer(&mut self, input: &Tensor) -> Result<RawOutput>;
 }
 
-pub struct DummyBackend {
-    model: ModelConfig,
+pub struct OnnxBackend {
+    session: ort::session::Session,
+    input_name: String,
 }
 
-impl DummyBackend {
-    pub fn new(model: ModelConfig) -> Self {
-        Self { model }
+impl OnnxBackend {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+
+        let environment = Arc::new(
+            Environment::builder()
+                .with_name("fire-engine")
+                .build()?,
+        );
+
+        let cuda = CUDAExecutionProvider::default();
+
+        let session = SessionBuilder::new(&environment)?
+            .with_execution_providers([cuda.into()])?
+            .with_model_from_file(path)?;
+
+        let input_name = session.inputs[0].name.clone();
+
+        Ok(Self {
+            session,
+            input_name,
+        })
     }
 }
 
-#[async_trait::async_trait]
-impl YoloBackend for DummyBackend {
-    async fn infer(&self, _input: &Tensor) -> Result<RawOutput> {
-        let n = 10usize;
-        let mut data = Vec::with_capacity(n * 6);
-        for i in 0..n {
-            let x1 = 0.1 + i as f32 * 0.01;
-            let y1 = 0.1 + i as f32 * 0.01;
-            let x2 = 0.4 + i as f32 * 0.01;
-            let y2 = 0.4 + i as f32 * 0.01;
-            let score = 0.9 - i as f32 * 0.03;
-            let class_id = 0.0;
-            data.extend_from_slice(&[x1, y1, x2, y2, score, class_id]);
-        }
-        Ok(RawOutput { data, shape: vec![n, 6] })
-    }
-}
+#[async_trait]
+impl YoloBackend for OnnxBackend {
+    async fn infer(&mut self, input: &Tensor) -> Result<RawOutput> {
 
-#[cfg(feature = "triton")]
-pub struct TritonBackend {
-    model: ModelConfig,
-    cfg: BackendConfig,
-    client: triton_client::Client,
-}
+        let dims = vec![
+            input.shape[0] as i64,
+            input.shape[1] as i64,
+            input.shape[2] as i64,
+            input.shape[3] as i64,
+        ];
 
-#[cfg(feature = "triton")]
-impl TritonBackend {
-    pub async fn connect(model: ModelConfig, cfg: BackendConfig) -> Result<Self> {
-        let tr = cfg.triton.clone().ok_or_else(|| anyhow::anyhow!("missing triton config"))?;
-        let client = triton_client::Client::new(tr.url)?;
-        Ok(Self { model, cfg, client })
-    }
-}
+        let input_tensor = Value::from_array(
+            self.session.allocator(),
+            &dims,
+            &input.data,
+        )?;
 
-#[cfg(feature = "triton")]
-#[async_trait::async_trait]
-impl YoloBackend for TritonBackend {
-    async fn infer(&self, input: &Tensor) -> Result<RawOutput> {
-        let tr = self.cfg.triton.clone().ok_or_else(|| anyhow::anyhow!("missing triton config"))?;
+        let outputs = self.session.run(vec![(
+            self.input_name.as_str(),
+            input_tensor,
+        )])?;
 
-        let mut infer_input = triton_client::InferInput::new(tr.input_name, input.shape.to_vec(), "FP32")?;
-        infer_input.set_data(input.data.clone());
+        let output_tensor: OrtOwnedTensor<f32, _> =
+            outputs[0].try_extract()?;
 
-        let outputs = vec![triton_client::InferRequestedOutput::new(tr.output_name)];
+        let shape = output_tensor
+            .view()
+            .shape()
+            .iter()
+            .map(|d| *d as usize)
+            .collect();
 
-        let req = triton_client::InferRequest::new(tr.model_name, tr.model_version.as_deref(), vec![infer_input], outputs);
-        let resp = self.client.infer(req).await?;
+        let data = output_tensor.view().iter().cloned().collect();
 
-        let out = resp.get_output(&tr.output_name).ok_or_else(|| anyhow::anyhow!("missing output"))?;
-        let data = out.as_f32()?.to_vec();
-        let shape = out.shape().to_vec();
-
-        Ok(RawOutput { data, shape })
+        Ok(RawOutput { shape, data })
     }
 }
