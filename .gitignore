@@ -37,3 +37,5 @@ venv/
 
 
 .idea/
+
+onnxruntime-linux-x64-gpu-1.17.3.tgz
