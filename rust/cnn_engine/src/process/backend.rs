@@ -1,80 +1,55 @@
-use crate::io::{BackendConfig, ModelConfig, RawOutput, Tensor};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use async_trait::async_trait;
+use ort::execution_providers::{CUDAExecutionProvider, CPUExecutionProvider, ExecutionProvider};
+use ort::session::Session;
+use ort::value::Tensor as OrtTensor;
+use std::path::Path;
 
-#[derive(Clone, Serialize, Deserialize)]
-pub enum BackendKind {
-    Dummy,
-    Triton,
-}
+use crate::io::{RawOutput, Tensor};
 
-#[async_trait::async_trait]
+#[async_trait]
 pub trait YoloBackend: Send + Sync {
-    async fn infer(&self, input: &Tensor) -> Result<RawOutput>;
+    async fn infer(&mut self, input: &Tensor) -> Result<RawOutput>;
 }
 
-pub struct DummyBackend {
-    model: ModelConfig,
+pub struct OnnxBackend {
+    session: Session,
+    input_name: String,
 }
 
-impl DummyBackend {
-    pub fn new(model: ModelConfig) -> Self {
-        Self { model }
+impl OnnxBackend {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let cuda = CUDAExecutionProvider::default();
+        let has_cuda = cuda.is_available()?;
+
+        let builder = if has_cuda {
+            Session::builder()?.with_execution_providers([cuda.build()])?
+        } else {
+            Session::builder()?.with_execution_providers([CPUExecutionProvider::default().build()])?
+        };
+
+        let session = builder.commit_from_file(path)?;
+        let input_name = session.inputs()[0].name().to_string();
+
+        Ok(Self { session, input_name })
     }
 }
 
-#[async_trait::async_trait]
-impl YoloBackend for DummyBackend {
-    async fn infer(&self, _input: &Tensor) -> Result<RawOutput> {
-        let n = 10usize;
-        let mut data = Vec::with_capacity(n * 6);
-        for i in 0..n {
-            let x1 = 0.1 + i as f32 * 0.01;
-            let y1 = 0.1 + i as f32 * 0.01;
-            let x2 = 0.4 + i as f32 * 0.01;
-            let y2 = 0.4 + i as f32 * 0.01;
-            let score = 0.9 - i as f32 * 0.03;
-            let class_id = 0.0;
-            data.extend_from_slice(&[x1, y1, x2, y2, score, class_id]);
-        }
-        Ok(RawOutput { data, shape: vec![n, 6] })
-    }
-}
+#[async_trait]
+impl YoloBackend for OnnxBackend {
+    async fn infer(&mut self, input: &Tensor) -> Result<RawOutput> {
+        let dims = [input.shape[0], input.shape[1], input.shape[2], input.shape[3]];
+        let input_tensor = OrtTensor::from_array((dims, input.data.clone()))?;
 
-#[cfg(feature = "triton")]
-pub struct TritonBackend {
-    model: ModelConfig,
-    cfg: BackendConfig,
-    client: triton_client::Client,
-}
+        let outputs = self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => input_tensor])?;
 
-#[cfg(feature = "triton")]
-impl TritonBackend {
-    pub async fn connect(model: ModelConfig, cfg: BackendConfig) -> Result<Self> {
-        let tr = cfg.triton.clone().ok_or_else(|| anyhow::anyhow!("missing triton config"))?;
-        let client = triton_client::Client::new(tr.url)?;
-        Ok(Self { model, cfg, client })
-    }
-}
+        let (shape, data) = outputs[0].try_extract_tensor::<f32>()?;
 
-#[cfg(feature = "triton")]
-#[async_trait::async_trait]
-impl YoloBackend for TritonBackend {
-    async fn infer(&self, input: &Tensor) -> Result<RawOutput> {
-        let tr = self.cfg.triton.clone().ok_or_else(|| anyhow::anyhow!("missing triton config"))?;
+        let shape = shape.iter().map(|d| *d as usize).collect();
+        let data = data.iter().cloned().collect();
 
-        let mut infer_input = triton_client::InferInput::new(tr.input_name, input.shape.to_vec(), "FP32")?;
-        infer_input.set_data(input.data.clone());
-
-        let outputs = vec![triton_client::InferRequestedOutput::new(tr.output_name)];
-
-        let req = triton_client::InferRequest::new(tr.model_name, tr.model_version.as_deref(), vec![infer_input], outputs);
-        let resp = self.client.infer(req).await?;
-
-        let out = resp.get_output(&tr.output_name).ok_or_else(|| anyhow::anyhow!("missing output"))?;
-        let data = out.as_f32()?.to_vec();
-        let shape = out.shape().to_vec();
-
-        Ok(RawOutput { data, shape })
+        Ok(RawOutput { shape, data })
     }
 }

@@ -35,3 +35,9 @@ __pycache__/
 venv/
 .envrc
 
+
+.idea/
+
+onnxruntime-linux-x64-gpu-1.17.3.tgz
+
+onnxruntime-linux-x64-gpu-1.17.3.tgz
